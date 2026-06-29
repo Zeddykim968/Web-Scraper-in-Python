@@ -26,9 +26,12 @@ import logging
 import argparse
 import urllib.request
 import urllib.error
+import requests
+
 from html import unescape
 from datetime import date, datetime
 from pathlib import Path
+from bs4 import BeautifulSoup
 
 import pandas as pd
 
@@ -75,23 +78,35 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# create a requests session to reuse connections
+session = requests.Session()
+session.headers.update(HEADERS)
+
 
 # HTTP helpers 
 
 def fetch(url: str, retries: int = 3) -> str | None:
     for attempt in range(1, retries + 1):
         try:
-            req = urllib.request.Request(url, headers=HEADERS)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            log.warning(f"HTTP {e.code} for {url} (attempt {attempt}/{retries})")
-            if e.code in (403, 404, 410):
-                return None
-            time.sleep(2 * attempt)
-        except Exception as e:
+            resp = session.get(url, timeout=30)
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding
+            return resp.text
+        
+        except requests.RequestException as e:
+            status = resp.status_code
             log.warning(f"Error fetching {url}: {e} (attempt {attempt}/{retries})")
-            time.sleep(2 * attempt)
+
+            if status in (403, 404, 410):
+                log.warning(f"  → Permanent error {status} — skipping URL")
+                return None
+            
+        except requests.RequestException as e:
+                log.warning(
+                    f"{e}"
+                    f" (attempt {attempt}/{retries})"
+                )
+        time.sleep(2 * attempt)
     return None
 
 
@@ -158,14 +173,29 @@ def infer_category(name: str, category_text: str) -> str | None:
 def parse_date_str(text: str | None) -> date | None:
     if not text:
         return None
+    
+    text = clean(text)
+
     # ISO format e.g. "2025-03-14T10:22:00.000000Z"
-    m = re.match(r"(\d{4}-\d{2}-\d{2})", text)
-    if m:
-        try:
-            return datetime.strptime(m.group(1), "%Y-%m-%d").date()
-        except ValueError:
-            pass
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        pass
+    
+    # example: "14 March 2025"
+    try:
+        return datetime.strptime(text, "%d %B %Y").date()
+    except ValueError:
+        pass
+    
+    # example: "12 Jun 2025"
+    try:
+        return datetime.strptime(text, "%d %b %Y").date()
+    except ValueError:
+        pass
+    
     return None
+
 
 
 def is_in_date_range(d: date | None) -> bool:
@@ -188,14 +218,19 @@ def get_listing_urls_from_search_page(page_num: int) -> list[str]:
         return []
 
     # Extract all /listings/... hrefs (exclude anchors and query strings)
-    raw = re.findall(r'href="(/listings/[^"#?]+)"', body)
+    soup = BeautifulSoup(body, "lxml")
     # Deduplicate while preserving order, exclude non-listing paths
     seen = set()
     urls = []
-    for path in raw:
-        if path not in seen and re.search(r'/listings/[^/]+-\d+$', path):
-            seen.add(path)
-            urls.append(BASE_URL + path)
+    for link in soup.find_all("a", href=True):
+        path = link["href"]
+        
+        if path.startswith("/listings/"):
+            full_url = BASE_URL + path.split("#")[0].split("?")[0]
+            
+            if full_url not in seen:
+                seen.add(full_url)
+                urls.append(full_url)
 
     log.info(f"  Search page {page_num}: {len(urls)} listing URLs")
     return urls
@@ -209,20 +244,37 @@ def scrape_listing_detail(url: str) -> dict:
 
     body = fetch(url)
     if not body:
+        log.warning(f"Failed to fetch listing detail page: {url}")
         return record
+    
+    soup = BeautifulSoup(body, "lxml")
+
+    page_text = soup.get_text(" ", strip=True)
+    page_text_lower = page_text.lower()
 
     # JSON-LD structured data 
-    ld_raw = re.findall(
-        r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
-        body, re.DOTALL
-    )
-    ld_graph = []
-    if ld_raw:
+
+
+    scripts = soup.find("script", type="application/ld+json")
+
+    ld_graph: list[dict] = []
+
+    for script in scripts:
+
+        if not script.string:
+            continue
+        
         try:
-            ld = json.loads(ld_raw[0])
-            ld_graph = ld.get("@graph", [])
-        except Exception:
-            pass
+            data = json.loads(script.string)
+
+            if "@graph" in data:
+                ld_graph.extend(data["@graph"])
+            else:
+                ld_graph.append(data)
+
+        except json.JSONDecodeError:
+            log.warning(f"Failed to parse JSON-LD in {url}")
+            continue        
 
     # Index by type
     ld_by_type: dict = {}
@@ -240,9 +292,14 @@ def scrape_listing_detail(url: str) -> dict:
         name = clean(raw_name)
     if not name:
         # Fallback to og:title meta
-        m = re.search(r'<meta[^>]+og:title[^>]+content="([^"]+)"', body)
-        if m:
-            name = clean(m.group(1).split("|")[0])
+        meta_title = soup.find("meta", property="og:title")
+
+        if meta_title:
+            content = meta_title.get("content", "")
+            if content:
+                raw_name = re.sub(r"\s*\|\s*BuyRentKenya.*$", "", content)
+                raw_name = re.sub(r"\s+for\s+KSh[\d,\s]+$", "", raw_name)
+                name = clean(raw_name)
     record["Name"] = name
 
     # Price
@@ -255,20 +312,17 @@ def scrape_listing_detail(url: str) -> dict:
         price = f"KSh {float(price_val):,.0f}" if isinstance(price_val, (int, float)) else f"KSh {price_val}"
     if not price:
         # Regex from HTML body
-        m = re.search(r"KSh[\s\xa0]*([\d,]+(?:\.\d+)?)", body)
+        m = re.search(r"KSh[\s\xa0]*([\d,]+(?:\.\d+)?)", page_text)
         if m:
             price = f"KSh {m.group(1)}"
     record["Price"] = price
 
     # Date 
     listing_date = None
-    rel = ld_by_type.get("RealEstateListing", {})
-    for date_field in ("datePublished", "dateCreated", "dateModified"):
-        raw_date = rel.get(date_field)
-        if raw_date:
-            listing_date = parse_date_str(raw_date)
-            if listing_date:
-                break
+    match = re.search(r"Created At:\s*(\d{1,2}\s+\w+\s+\d{4})", page_text)
+    if match:
+        listing_date = datetime.strptime(match.group(1), "%d %B %Y")
+
     record["Date"] = listing_date.strftime("%Y-%m-%d") if listing_date else None
 
     # Category & accommodation type 
@@ -280,7 +334,7 @@ def scrape_listing_detail(url: str) -> dict:
 
     description = (
         product.get("description") or
-        rel.get("description") or ""
+        accommodation.get("description") or ""
     )
 
     # Use JSON-LD accommodationCategory as the primary source of Type
@@ -343,31 +397,31 @@ def scrape_listing_detail(url: str) -> dict:
     if beds is not None:
         record["No. of Bedrooms"] = parse_int(str(beds))
     else:
-        m = re.search(r"(\d+)\s*[Bb]ed(?:room)?s?", body)
+        m = re.search(r"(\d+)\s*[Bb]ed(?:room)?s?", page_text)
         if m:
             record["No. of Bedrooms"] = int(m.group(1))
 
     if baths is not None:
         record["No. of Bathrooms"] = parse_int(str(baths))
     else:
-        m = re.search(r"(\d+)\s*[Bb]ath(?:room)?s?", body)
+        m = re.search(r"(\d+)\s*[Bb]ath(?:room)?s?", page_text)
         if m:
             record["No. of Bathrooms"] = int(m.group(1))
 
     # En-suite bedrooms 
     ensuite_m = re.search(
-        r"(\d+)\s*(?:en[\s\-]?suite|ensuite)", body, re.IGNORECASE
+        r"(\d+)\s*(?:en[\s\-]?suite|ensuite)", page_text_lower, re.IGNORECASE
     )
     if ensuite_m:
         record["No. of Ensuite Bedrooms"] = int(ensuite_m.group(1))
-    elif "en suite" in body.lower() or "ensuite" in body.lower():
+    elif "en suite" in page_text_lower or "ensuite" in page_text_lower:
         # If mentioned but no count, assume 1
         record["No. of Ensuite Bedrooms"] = 1
 
     # Floor area (sqm) 
     area_m = re.search(
         r"([\d,]+(?:\.\d+)?)\s*(?:sq\.?\s*m|sqm|m²|sqft|sq ft|ft^2|square\s*met(?:er|re)s?)",
-        body, re.IGNORECASE
+        page_text_lower, re.IGNORECASE
     )
     if area_m:
         record["Floor_area_sqm"] = parse_float(area_m.group(1))
@@ -375,7 +429,7 @@ def scrape_listing_detail(url: str) -> dict:
     # Land size 
     land_m = re.search(
         r"([\d,]+(?:\.\d+)?)\s*(?:acres?|ha\b|hectares?)",
-        body, re.IGNORECASE
+        page_text_lower, re.IGNORECASE
     )
     if land_m:
         unit = re.search(r"(?:acres?|ha\b|hectares?)", land_m.group(0), re.IGNORECASE)
@@ -383,7 +437,7 @@ def scrape_listing_detail(url: str) -> dict:
 
     # Amenities from description text 
     desc_lower = description.lower()
-    body_lower = body.lower()
+    body_lower = page_text_lower
 
     # Elevator
     record["Elevator"] = 1 if re.search(r"\b(?:lift|elevator)\b", desc_lower + body_lower) else 0
@@ -412,7 +466,7 @@ def scrape_listing_detail(url: str) -> dict:
     # Floor number (apartments) 
     floor_m = re.search(
         r"(?:on\s+(?:the\s+)?)?(?:floor|level)\s*(?:no\.?\s*)?(\d+|ground|basement|lower|upper|top)",
-        body, re.IGNORECASE
+        page_text_lower, re.IGNORECASE
     )
     if floor_m:
         val = floor_m.group(1).lower()
@@ -430,7 +484,7 @@ def scrape_listing_detail(url: str) -> dict:
 
 def scrape(
     max_pages: int = 50,
-    output_file: str = "buyrentkenya_krppi.csv",
+    output_file: str = "buyrentkenya_property_data.csv",
     resume: bool = False,
 ) -> list[dict]:
     already_done: set[str] = set()
@@ -535,7 +589,7 @@ if __name__ == "__main__":
         help="Max search pages to crawl (default: 50, ~24 listings each)"
     )
     parser.add_argument(
-        "--output", type=str, default="buyrentkenya_krppi.csv",
+        "--output", type=str, default="buyrentkenya_property_data.csv",
         help="Output CSV file name"
     )
     parser.add_argument(
